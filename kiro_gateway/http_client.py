@@ -157,10 +157,12 @@ class KiroHttpClient:
             HTTPException: After retry failure
         """
         if stream:
+            # 流式请求：使用较长的连接超时，实际读取超时在 streaming.py 中控制
             timeout = first_token_timeout or settings.first_token_timeout
             max_retries = settings.first_token_max_retries
         else:
-            timeout = 300
+            # 非流式请求：使用配置的超时时间（默认 600 秒）
+            timeout = settings.non_stream_timeout
             max_retries = settings.max_retries
 
         client = await self._get_client()

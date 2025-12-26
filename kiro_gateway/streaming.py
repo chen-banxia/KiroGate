@@ -55,6 +55,38 @@ class FirstTokenTimeoutError(Exception):
     pass
 
 
+class StreamReadTimeoutError(Exception):
+    """Exception raised when stream read timeout occurs."""
+    pass
+
+
+async def _read_chunk_with_timeout(
+    byte_iterator,
+    timeout: float
+) -> bytes:
+    """
+    Read a chunk from byte iterator with timeout.
+
+    Args:
+        byte_iterator: Async byte iterator
+        timeout: Timeout in seconds
+
+    Returns:
+        Bytes chunk
+
+    Raises:
+        StreamReadTimeoutError: If timeout occurs
+        StopAsyncIteration: If iterator is exhausted
+    """
+    try:
+        return await asyncio.wait_for(
+            byte_iterator.__anext__(),
+            timeout=timeout
+        )
+    except asyncio.TimeoutError:
+        raise StreamReadTimeoutError(f"Stream read timeout after {timeout}s")
+
+
 def _calculate_usage_tokens(
     full_content: str,
     context_usage_percentage: Optional[float],
@@ -173,6 +205,7 @@ async def stream_kiro_to_openai_internal(
     model_cache: "ModelInfoCache",
     auth_manager: "KiroAuthManager",
     first_token_timeout: float = settings.first_token_timeout,
+    stream_read_timeout: float = settings.stream_read_timeout,
     request_messages: Optional[list] = None,
     request_tools: Optional[list] = None
 ) -> AsyncGenerator[str, None]:
@@ -192,6 +225,7 @@ async def stream_kiro_to_openai_internal(
         model_cache: Model cache for token limits
         auth_manager: Authentication manager
         first_token_timeout: First token timeout (seconds)
+        stream_read_timeout: Stream read timeout for subsequent chunks (seconds)
         request_messages: Original request messages (for fallback token counting)
         request_tools: Original request tools (for fallback token counting)
 
@@ -200,6 +234,7 @@ async def stream_kiro_to_openai_internal(
 
     Raises:
         FirstTokenTimeoutError: If first token not received within timeout
+        StreamReadTimeoutError: If stream read times out
     """
     completion_id = generate_completion_id()
     created_time = int(time.time())
@@ -263,8 +298,16 @@ async def stream_kiro_to_openai_internal(
             elif event["type"] == "context_usage":
                 context_usage_percentage = event["data"]
 
-        # Continue reading remaining chunks
-        async for chunk in byte_iterator:
+        # Continue reading remaining chunks with timeout
+        while True:
+            try:
+                chunk = await _read_chunk_with_timeout(byte_iterator, stream_read_timeout)
+            except StopAsyncIteration:
+                break
+            except StreamReadTimeoutError as e:
+                logger.error(f"Stream read timeout: {e}")
+                raise
+
             if debug_logger:
                 debug_logger.log_raw_chunk(chunk)
 
@@ -363,6 +406,8 @@ async def stream_kiro_to_openai_internal(
         yield "data: [DONE]\n\n"
 
     except FirstTokenTimeoutError:
+        raise
+    except StreamReadTimeoutError:
         raise
     except Exception as e:
         logger.error(f"Error during streaming: {e}", exc_info=True)
@@ -654,7 +699,8 @@ async def stream_kiro_to_anthropic(
     auth_manager: "KiroAuthManager",
     request_messages: Optional[list] = None,
     request_tools: Optional[list] = None,
-    thinking_enabled: bool = False
+    thinking_enabled: bool = False,
+    stream_read_timeout: float = settings.stream_read_timeout
 ) -> AsyncGenerator[str, None]:
     """
     Преобразует поток Kiro в формат Anthropic SSE.
@@ -676,6 +722,7 @@ async def stream_kiro_to_anthropic(
         request_messages: Сообщения запроса (для подсчёта токенов)
         request_tools: Инструменты запроса (для подсчёта токенов)
         thinking_enabled: Включен ли режим thinking
+        stream_read_timeout: Stream read timeout for each chunk (seconds)
 
     Yields:
         Строки в формате Anthropic SSE
@@ -706,7 +753,17 @@ async def stream_kiro_to_anthropic(
         }
         yield f"event: message_start\ndata: {json.dumps(message_start, ensure_ascii=False)}\n\n"
 
-        async for chunk in response.aiter_bytes():
+        # Read chunks with timeout
+        byte_iterator = response.aiter_bytes()
+        while True:
+            try:
+                chunk = await _read_chunk_with_timeout(byte_iterator, stream_read_timeout)
+            except StopAsyncIteration:
+                break
+            except StreamReadTimeoutError as e:
+                logger.error(f"Anthropic stream read timeout: {e}")
+                raise
+
             if debug_logger:
                 debug_logger.log_raw_chunk(chunk)
 
@@ -863,7 +920,8 @@ async def collect_anthropic_response(
     model_cache: "ModelInfoCache",
     auth_manager: "KiroAuthManager",
     request_messages: Optional[list] = None,
-    request_tools: Optional[list] = None
+    request_tools: Optional[list] = None,
+    stream_read_timeout: float = settings.stream_read_timeout
 ) -> dict:
     """
     Собирает полный ответ из streaming потока и преобразует в формат Anthropic.
@@ -876,6 +934,7 @@ async def collect_anthropic_response(
         auth_manager: Менеджер аутентификации
         request_messages: Сообщения запроса
         request_tools: Инструменты запроса
+        stream_read_timeout: Stream read timeout for each chunk (seconds)
 
     Returns:
         Словарь с ответом в формате Anthropic Messages API
@@ -887,7 +946,17 @@ async def collect_anthropic_response(
     content_parts: list[str] = []  # 使用 list 替代字符串拼接，提升性能
 
     try:
-        async for chunk in response.aiter_bytes():
+        # Read chunks with timeout
+        byte_iterator = response.aiter_bytes()
+        while True:
+            try:
+                chunk = await _read_chunk_with_timeout(byte_iterator, stream_read_timeout)
+            except StopAsyncIteration:
+                break
+            except StreamReadTimeoutError as e:
+                logger.error(f"Anthropic collect stream read timeout: {e}")
+                raise
+
             if debug_logger:
                 debug_logger.log_raw_chunk(chunk)
 

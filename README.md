@@ -145,6 +145,27 @@ KIRO_REGION="us-east-1"
 - **简单模式**：必须配置 `REFRESH_TOKEN` 环境变量
 - **组合模式**：无需配置 `REFRESH_TOKEN`，用户在请求中直接传递
 
+### 超时配置
+
+对于 `claude-opus-4-5` 等响应较慢的模型，可以调整超时设置：
+
+```env
+# 首个 token 超时（秒）- 等待模型开始响应的时间
+# 对于 Opus 等慢模型，建议 60-120 秒
+FIRST_TOKEN_TIMEOUT="60"
+
+# 首个 token 超时重试次数
+FIRST_TOKEN_MAX_RETRIES="5"
+
+# 流式读取超时（秒）- 读取流中每个 chunk 的最大等待时间
+# 对于 Opus 等慢模型，建议 120-300 秒
+STREAM_READ_TIMEOUT="120"
+
+# 非流式请求超时（秒）- 等待完整响应的最大时间
+# 对于复杂请求，建议 300-600 秒
+NON_STREAM_TIMEOUT="600"
+```
+
 ### 获取 Refresh Token
 
 #### 推荐方式：使用 Kiro Account Manager ✨

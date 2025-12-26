@@ -147,14 +147,23 @@ class Settings(BaseSettings):
     log_level: str = Field(default="INFO", alias="LOG_LEVEL")
 
     # ==================================================================================================
-    # 首个 Token 超时设置（流式重试）
+    # 超时设置
     # ==================================================================================================
 
     # 等待模型首个 token 的超时时间（秒）
-    first_token_timeout: float = Field(default=15.0, alias="FIRST_TOKEN_TIMEOUT")
+    # 对于 Opus 等慢模型，建议设置为 60-120 秒
+    first_token_timeout: float = Field(default=60.0, alias="FIRST_TOKEN_TIMEOUT")
 
     # 首个 token 超时时的最大重试次数
-    first_token_max_retries: int = Field(default=3, alias="FIRST_TOKEN_MAX_RETRIES")
+    first_token_max_retries: int = Field(default=5, alias="FIRST_TOKEN_MAX_RETRIES")
+
+    # 流式读取超时（秒）- 读取流中每个 chunk 的最大等待时间
+    # 对于 Opus 等慢模型，建议设置为 120-300 秒
+    stream_read_timeout: float = Field(default=120.0, alias="STREAM_READ_TIMEOUT")
+
+    # 非流式请求超时（秒）- 等待完整响应的最大时间
+    # 对于复杂请求，建议设置为 300-600 秒
+    non_stream_timeout: float = Field(default=600.0, alias="NON_STREAM_TIMEOUT")
 
     # ==================================================================================================
     # 调试设置
@@ -221,6 +230,8 @@ TOOL_DESCRIPTION_MAX_LENGTH: int = settings.tool_description_max_length
 LOG_LEVEL: str = settings.log_level
 FIRST_TOKEN_TIMEOUT: float = settings.first_token_timeout
 FIRST_TOKEN_MAX_RETRIES: int = settings.first_token_max_retries
+STREAM_READ_TIMEOUT: float = settings.stream_read_timeout
+NON_STREAM_TIMEOUT: float = settings.non_stream_timeout
 DEBUG_MODE: str = settings.debug_mode
 DEBUG_DIR: str = settings.debug_dir
 RATE_LIMIT_PER_MINUTE: int = settings.rate_limit_per_minute
