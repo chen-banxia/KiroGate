@@ -218,6 +218,26 @@ async def _parse_auth_header(auth_header: str, request: Request = None) -> tuple
 
     token = auth_header[7:]  # Remove "Bearer "
 
+    # Check if token contains ':' (multi-tenant format)
+    if ':' in token:
+        parts = token.split(':', 1)  # Split only once
+        proxy_key = parts[0]
+        refresh_token = parts[1]
+
+        # Verify proxy key
+        if not secrets.compare_digest(proxy_key, PROXY_API_KEY):
+            logger.warning(f"[{get_timestamp()}] 多租户模式下 Proxy Key 无效: {_mask_token(proxy_key)}")
+            raise HTTPException(status_code=401, detail="API Key 无效或缺失")
+
+        # Get or create AuthManager for this refresh token
+        logger.debug(f"[{get_timestamp()}] 多租户模式: 使用自定义 Refresh Token {_mask_token(refresh_token)}")
+        auth_manager = await auth_cache.get_or_create(
+            refresh_token=refresh_token,
+            region=settings.region,
+            profile_arn=settings.profile_arn
+        )
+        return proxy_key, auth_manager, None, None
+
     # Check if it's a user API key (sk-xxx format)
     if token.startswith("sk-"):
         from kiro_gateway.database import user_db
@@ -251,26 +271,6 @@ async def _parse_auth_header(auth_header: str, request: Request = None) -> tuple
         except NoTokenAvailable as e:
             logger.warning(f"[{get_timestamp()}] 用户可用 Token 不足: 用户ID={user_id}, 错误={e}")
             raise HTTPException(status_code=503, detail="该用户暂无可用的 Token")
-
-    # Check if token contains ':' (multi-tenant format)
-    if ':' in token:
-        parts = token.split(':', 1)  # Split only once
-        proxy_key = parts[0]
-        refresh_token = parts[1]
-
-        # Verify proxy key
-        if not secrets.compare_digest(proxy_key, PROXY_API_KEY):
-            logger.warning(f"[{get_timestamp()}] 多租户模式下 Proxy Key 无效: {_mask_token(proxy_key)}")
-            raise HTTPException(status_code=401, detail="API Key 无效或缺失")
-
-        # Get or create AuthManager for this refresh token
-        logger.debug(f"[{get_timestamp()}] 多租户模式: 使用自定义 Refresh Token {_mask_token(refresh_token)}")
-        auth_manager = await auth_cache.get_or_create(
-            refresh_token=refresh_token,
-            region=settings.region,
-            profile_arn=settings.profile_arn
-        )
-        return proxy_key, auth_manager, None, None
     else:
         # Traditional mode: verify entire token as PROXY_API_KEY
         if not secrets.compare_digest(token, PROXY_API_KEY):
@@ -342,6 +342,26 @@ async def verify_anthropic_api_key(
     """
     # Try x-api-key first (Anthropic format)
     if x_api_key:
+        # Check if x-api-key contains ':' (multi-tenant format)
+        if ':' in x_api_key:
+            parts = x_api_key.split(':', 1)
+            proxy_key = parts[0]
+            refresh_token = parts[1]
+
+            # Verify proxy key
+            if not secrets.compare_digest(proxy_key, PROXY_API_KEY):
+                logger.warning(f"[{get_timestamp()}] x-api-key 多租户模式下 Proxy Key 无效: {_mask_token(proxy_key)}")
+                raise HTTPException(status_code=401, detail="API Key 无效或缺失")
+
+            # Get or create AuthManager for this refresh token
+            logger.debug(f"[{get_timestamp()}] x-api-key 多租户模式: 使用自定义 Refresh Token {_mask_token(refresh_token)}")
+            auth_manager = await auth_cache.get_or_create(
+                refresh_token=refresh_token,
+                region=settings.region,
+                profile_arn=settings.profile_arn
+            )
+            return auth_manager
+
         # Check if it's a user API key (sk-xxx format)
         if x_api_key.startswith("sk-"):
             from kiro_gateway.database import user_db
@@ -372,26 +392,6 @@ async def verify_anthropic_api_key(
             except NoTokenAvailable as e:
                 logger.warning(f"[{get_timestamp()}] 用户可用 Token 不足: 用户ID={user_id}, 错误={e}")
                 raise HTTPException(status_code=503, detail="该用户暂无可用的 Token")
-
-        # Check if x-api-key contains ':' (multi-tenant format)
-        if ':' in x_api_key:
-            parts = x_api_key.split(':', 1)
-            proxy_key = parts[0]
-            refresh_token = parts[1]
-
-            # Verify proxy key
-            if not secrets.compare_digest(proxy_key, PROXY_API_KEY):
-                logger.warning(f"[{get_timestamp()}] x-api-key 多租户模式下 Proxy Key 无效: {_mask_token(proxy_key)}")
-                raise HTTPException(status_code=401, detail="API Key 无效或缺失")
-
-            # Get or create AuthManager for this refresh token
-            logger.debug(f"[{get_timestamp()}] x-api-key 多租户模式: 使用自定义 Refresh Token {_mask_token(refresh_token)}")
-            auth_manager = await auth_cache.get_or_create(
-                refresh_token=refresh_token,
-                region=settings.region,
-                profile_arn=settings.profile_arn
-            )
-            return auth_manager
         else:
             # Traditional mode: verify entire x-api-key as PROXY_API_KEY
             if secrets.compare_digest(x_api_key, PROXY_API_KEY):
