@@ -1045,6 +1045,7 @@ async def admin_get_stats(request: Request):
         "token_valid": stats.get("tokenValid", False),
         "site_enabled": stats.get("siteEnabled", True),
         "self_use_enabled": stats.get("selfUseEnabled", False),
+        "require_approval": stats.get("requireApproval", True),
         "banned_count": stats.get("bannedIPs", 0),
         "cached_tokens": stats.get("cached_tokens", 0),
         "cache_size": stats.get("cacheSize", 0),
@@ -1184,6 +1185,21 @@ async def admin_toggle_self_use(
         return JSONResponse(status_code=401, content={"error": "未授权"})
     from kiro_gateway.metrics import metrics
     success = metrics.set_self_use_enabled(enabled)
+    return {"success": success, "enabled": enabled}
+
+
+@router.post("/admin/api/toggle-approval", include_in_schema=False)
+async def admin_toggle_approval(
+    request: Request,
+    enabled: bool = Form(...),
+    _csrf: None = Depends(require_same_origin)
+):
+    """Toggle registration approval requirement."""
+    session = request.cookies.get("admin_session")
+    if not verify_admin_session(session):
+        return JSONResponse(status_code=401, content={"error": "未授权"})
+    from kiro_gateway.metrics import metrics
+    success = metrics.set_require_approval(enabled)
     return {"success": success, "enabled": enabled}
 
 @router.get("/admin/api/proxy-key", include_in_schema=False)
@@ -1727,6 +1743,7 @@ async def admin_get_users(
     search: str = Query("", alias="search"),
     is_admin: bool | None = Query(None),
     is_banned: bool | None = Query(None),
+    approval_status: str | None = Query(None),
     trust_level: int | None = Query(None),
     sort_field: str = Query("created_at"),
     sort_order: str = Query("desc"),
@@ -1747,6 +1764,7 @@ async def admin_get_users(
         search=search,
         is_admin=is_admin,
         is_banned=is_banned,
+        approval_status=approval_status,
         trust_level=trust_level,
         sort_field=sort_field,
         sort_order=sort_order
@@ -1755,6 +1773,7 @@ async def admin_get_users(
         search=search,
         is_admin=is_admin,
         is_banned=is_banned,
+        approval_status=approval_status,
         trust_level=trust_level
     )
 
@@ -1763,11 +1782,13 @@ async def admin_get_users(
             "id": user.id,
             "linuxdo_id": user.linuxdo_id,
             "github_id": user.github_id,
+            "email": user.email,
             "username": user.username,
             "avatar_url": user.avatar_url,
             "trust_level": user.trust_level,
             "is_admin": user.is_admin,
             "is_banned": user.is_banned,
+            "approval_status": user.approval_status,
             "created_at": user.created_at,
             "last_login": user.last_login,
             "token_count": user_db.get_token_count(user.id)["total"],
@@ -1842,6 +1863,36 @@ async def admin_unban_user(
     from kiro_gateway.database import user_db
     success = user_db.set_user_banned(user_id, False)
     return {"success": success}
+
+
+@router.post("/admin/api/users/approve", include_in_schema=False)
+async def admin_approve_user(
+    request: Request,
+    user_id: int = Form(...),
+    _csrf: None = Depends(require_same_origin)
+):
+    """Approve a user registration."""
+    session = request.cookies.get("admin_session")
+    if not verify_admin_session(session):
+        return JSONResponse(status_code=401, content={"error": "未授权"})
+    from kiro_gateway.database import user_db
+    user_db.set_user_approval_status(user_id, "approved")
+    return {"success": True}
+
+
+@router.post("/admin/api/users/reject", include_in_schema=False)
+async def admin_reject_user(
+    request: Request,
+    user_id: int = Form(...),
+    _csrf: None = Depends(require_same_origin)
+):
+    """Reject a user registration."""
+    session = request.cookies.get("admin_session")
+    if not verify_admin_session(session):
+        return JSONResponse(status_code=401, content={"error": "未授权"})
+    from kiro_gateway.database import user_db
+    user_db.set_user_approval_status(user_id, "rejected")
+    return {"success": True}
 
 
 @router.get("/admin/api/donated-tokens", include_in_schema=False)
@@ -2059,6 +2110,55 @@ async def login_page(request: Request):
         return RedirectResponse(url=redirect_url, status_code=303)
     from kiro_gateway.pages import render_login_page
     return HTMLResponse(content=render_login_page())
+
+
+@router.post("/auth/login", include_in_schema=False)
+async def password_login(request: Request, email: str = Form(...), password: str = Form(...)):
+    """Handle email/password login."""
+    from kiro_gateway.user_manager import user_manager
+    user, result = user_manager.login_with_email(email=email, password=password)
+    if not user:
+        from kiro_gateway.pages import render_login_page
+        return HTMLResponse(content=render_login_page(error=result or "登录失败", email=email))
+    response = RedirectResponse(url="/user", status_code=303)
+    response.set_cookie(
+        key="user_session",
+        value=result,
+        httponly=True,
+        max_age=settings.user_session_max_age,
+        samesite=settings.user_cookie_samesite,
+        secure=_cookie_secure(request)
+    )
+    return response
+
+
+@router.post("/auth/register", include_in_schema=False)
+async def password_register(
+    request: Request,
+    email: str = Form(...),
+    password: str = Form(...),
+    username: str | None = Form(None)
+):
+    """Handle email/password registration."""
+    from kiro_gateway.user_manager import user_manager
+    user, result = user_manager.register_with_email(email=email, password=password, username=username)
+    if not user:
+        from kiro_gateway.pages import render_login_page
+        info = result if result == "注册成功，等待审核" else ""
+        error = "" if info else (result or "注册失败")
+        return HTMLResponse(
+            content=render_login_page(error=error, info=info, email=email, username=username)
+        )
+    response = RedirectResponse(url="/user", status_code=303)
+    response.set_cookie(
+        key="user_session",
+        value=result,
+        httponly=True,
+        max_age=settings.user_session_max_age,
+        samesite=settings.user_cookie_samesite,
+        secure=_cookie_secure(request)
+    )
+    return response
 
 
 @router.get("/oauth2/github/login", include_in_schema=False)

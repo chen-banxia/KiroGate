@@ -6,6 +6,11 @@ KiroGate 用户管理模块。
 处理用户会话、OAuth2 认证和用户相关操作。
 """
 
+import base64
+import binascii
+import hashlib
+import hmac
+import os
 import secrets
 from typing import Optional, Tuple
 
@@ -230,6 +235,29 @@ class UserManager:
         self.oauth = OAuth2Client()
         self.github = GitHubOAuth2Client()
 
+    def _hash_password(self, password: str) -> str:
+        """Hash password with PBKDF2."""
+        salt = os.urandom(16)
+        iterations = 120000
+        digest = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, iterations)
+        salt_b64 = base64.urlsafe_b64encode(salt).decode("ascii").rstrip("=")
+        hash_b64 = base64.urlsafe_b64encode(digest).decode("ascii").rstrip("=")
+        return f"pbkdf2_sha256${iterations}${salt_b64}${hash_b64}"
+
+    def _verify_password(self, password: str, stored: str) -> bool:
+        """Verify password hash."""
+        try:
+            algo, iterations_str, salt_b64, hash_b64 = stored.split("$", 3)
+            if algo != "pbkdf2_sha256":
+                return False
+            iterations = int(iterations_str)
+            salt = base64.urlsafe_b64decode(salt_b64 + "==")
+            expected = base64.urlsafe_b64decode(hash_b64 + "==")
+        except (ValueError, binascii.Error):
+            return False
+        digest = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, iterations)
+        return hmac.compare_digest(digest, expected)
+
     async def oauth_login(self, code: str) -> Tuple[Optional[User], Optional[str]]:
         """
         Complete OAuth2 login flow.
@@ -271,6 +299,8 @@ class UserManager:
             # Check if banned
             if user.is_banned:
                 return None, "用户已被封禁"
+            if user.approval_status != "approved":
+                return None, "账号审核中" if user.approval_status == "pending" else "账号已被拒绝"
         else:
             from kiro_gateway.metrics import metrics
             if metrics.is_self_use_enabled():
@@ -280,7 +310,8 @@ class UserManager:
                 linuxdo_id=linuxdo_id,
                 username=username,
                 avatar_url=avatar_url,
-                trust_level=trust_level
+                trust_level=trust_level,
+                approval_status="approved"
             )
             logger.info(f"New user registered: {username} (LinuxDo ID: {linuxdo_id})")
 
@@ -328,6 +359,8 @@ class UserManager:
             # Check if banned
             if user.is_banned:
                 return None, "用户已被封禁"
+            if user.approval_status != "approved":
+                return None, "账号审核中" if user.approval_status == "pending" else "账号已被拒绝"
         else:
             from kiro_gateway.metrics import metrics
             if metrics.is_self_use_enabled():
@@ -337,7 +370,8 @@ class UserManager:
                 github_id=github_id,
                 username=username,
                 avatar_url=avatar_url,
-                trust_level=0
+                trust_level=0,
+                approval_status="approved"
             )
             logger.info(f"New user registered via GitHub: {username} (GitHub ID: {github_id})")
 
@@ -351,9 +385,59 @@ class UserManager:
         if not user_id:
             return None
         user = user_db.get_user(user_id)
-        if user and user.is_banned:
+        if user and (user.is_banned or user.approval_status != "approved"):
             return None
         return user
+
+    def register_with_email(
+        self,
+        email: str,
+        password: str,
+        username: Optional[str] = None
+    ) -> Tuple[Optional[User], Optional[str]]:
+        """Register a new user with email/password."""
+        email = (email or "").strip().lower()
+        if not email or "@" not in email:
+            return None, "邮箱格式不正确"
+        if not password or len(password) < 8:
+            return None, "密码至少 8 位"
+        from kiro_gateway.metrics import metrics
+        if metrics.is_self_use_enabled():
+            return None, "自用模式下暂不开放注册"
+        existing = user_db.get_user_by_email(email)
+        if existing:
+            return None, "邮箱已注册"
+        display_name = (username or "").strip() or email.split("@", 1)[0]
+        approval_status = "pending" if metrics.is_require_approval() else "approved"
+        password_hash = self._hash_password(password)
+        user = user_db.create_user(
+            username=display_name,
+            email=email,
+            password_hash=password_hash,
+            approval_status=approval_status
+        )
+        if approval_status != "approved":
+            return None, "注册成功，等待审核"
+        session_token = self.session.create_session(user.id)
+        return user, session_token
+
+    def login_with_email(self, email: str, password: str) -> Tuple[Optional[User], Optional[str]]:
+        """Login with email/password."""
+        email = (email or "").strip().lower()
+        if not email or not password:
+            return None, "邮箱或密码不能为空"
+        user = user_db.get_user_by_email(email)
+        if not user or not user.password_hash:
+            return None, "邮箱或密码错误"
+        if not self._verify_password(password, user.password_hash):
+            return None, "邮箱或密码错误"
+        if user.is_banned:
+            return None, "用户已被封禁"
+        if user.approval_status != "approved":
+            return None, "账号审核中" if user.approval_status == "pending" else "账号已被拒绝"
+        user_db.update_last_login(user.id)
+        session_token = self.session.create_session(user.id)
+        return user, session_token
 
     def logout(self, session_token: str) -> bool:
         """Logout user (session invalidation is handled by cookie deletion)."""

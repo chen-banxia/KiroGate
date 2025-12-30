@@ -43,11 +43,14 @@ class User:
     id: int
     linuxdo_id: Optional[str]
     github_id: Optional[str]
+    email: Optional[str]
     username: str
     avatar_url: Optional[str]
     trust_level: int
     is_admin: bool
     is_banned: bool
+    approval_status: str
+    password_hash: Optional[str]
     created_at: int
     last_login: Optional[int]
 
@@ -117,11 +120,14 @@ class UserDatabase:
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     linuxdo_id TEXT,
                     github_id TEXT,
+                    email TEXT,
                     username TEXT NOT NULL,
                     avatar_url TEXT,
                     trust_level INTEGER DEFAULT 0,
                     is_admin INTEGER DEFAULT 0,
                     is_banned INTEGER DEFAULT 0,
+                    approval_status TEXT DEFAULT 'approved',
+                    password_hash TEXT,
                     created_at INTEGER NOT NULL,
                     last_login INTEGER
                 );
@@ -222,6 +228,14 @@ class UserDatabase:
                 conn.execute(
                     "ALTER TABLE tokens ADD COLUMN is_anonymous INTEGER DEFAULT 0"
                 )
+            user_columns = {row[1] for row in conn.execute("PRAGMA table_info(users)")}
+            if "email" not in user_columns:
+                conn.execute("ALTER TABLE users ADD COLUMN email TEXT")
+            if "approval_status" not in user_columns:
+                conn.execute("ALTER TABLE users ADD COLUMN approval_status TEXT DEFAULT 'approved'")
+            if "password_hash" not in user_columns:
+                conn.execute("ALTER TABLE users ADD COLUMN password_hash TEXT")
+            conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_users_email ON users(email)")
             announcement_columns = {row[1] for row in conn.execute("PRAGMA table_info(announcements)")}
             if "allow_guest" not in announcement_columns:
                 conn.execute(
@@ -251,31 +265,50 @@ class UserDatabase:
         username: str,
         linuxdo_id: Optional[str] = None,
         github_id: Optional[str] = None,
+        email: Optional[str] = None,
         avatar_url: Optional[str] = None,
-        trust_level: int = 0
+        trust_level: int = 0,
+        approval_status: str = "approved",
+        password_hash: Optional[str] = None
     ) -> User:
         """Create a new user."""
-        if not linuxdo_id and not github_id:
-            raise ValueError("必须提供 linuxdo_id 或 github_id")
+        if not linuxdo_id and not github_id and not email:
+            raise ValueError("必须提供 linuxdo_id、github_id 或 email")
 
         now = int(time.time() * 1000)
         with self._lock:
             with self._get_conn() as conn:
                 cursor = conn.execute(
-                    """INSERT INTO users (linuxdo_id, github_id, username, avatar_url, trust_level, created_at, last_login)
-                       VALUES (?, ?, ?, ?, ?, ?, ?)""",
-                    (linuxdo_id, github_id, username, avatar_url, trust_level, now, now)
+                    """INSERT INTO users
+                       (linuxdo_id, github_id, email, username, avatar_url, trust_level, approval_status, password_hash,
+                        created_at, last_login)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        linuxdo_id,
+                        github_id,
+                        email,
+                        username,
+                        avatar_url,
+                        trust_level,
+                        approval_status,
+                        password_hash,
+                        now,
+                        now
+                    )
                 )
                 user_id = cursor.lastrowid
                 return User(
                     id=user_id,
                     linuxdo_id=linuxdo_id,
                     github_id=github_id,
+                    email=email,
                     username=username,
                     avatar_url=avatar_url,
                     trust_level=trust_level,
                     is_admin=False,
                     is_banned=False,
+                    approval_status=approval_status,
+                    password_hash=password_hash,
                     created_at=now,
                     last_login=now
                 )
@@ -413,6 +446,12 @@ class UserDatabase:
             row = conn.execute("SELECT * FROM users WHERE github_id = ?", (github_id,)).fetchone()
             return self._row_to_user(row) if row else None
 
+    def get_user_by_email(self, email: str) -> Optional[User]:
+        """Get user by email."""
+        with self._get_conn() as conn:
+            row = conn.execute("SELECT * FROM users WHERE email = ?", (email,)).fetchone()
+            return self._row_to_user(row) if row else None
+
     def get_or_create_user_by_linuxdo(
         self,
         linuxdo_id: str,
@@ -448,11 +487,14 @@ class UserDatabase:
                     id=user_id,
                     linuxdo_id=linuxdo_id,
                     github_id=None,
+                    email=None,
                     username=username,
                     avatar_url=avatar_url,
                     trust_level=trust_level,
                     is_admin=False,
                     is_banned=False,
+                    approval_status="approved",
+                    password_hash=None,
                     created_at=now,
                     last_login=now
                 )
@@ -492,11 +534,14 @@ class UserDatabase:
                     id=user_id,
                     linuxdo_id=None,
                     github_id=github_id,
+                    email=None,
                     username=username,
                     avatar_url=avatar_url,
                     trust_level=trust_level,
                     is_admin=False,
                     is_banned=False,
+                    approval_status="approved",
+                    password_hash=None,
                     created_at=now,
                     last_login=now
                 )
@@ -520,6 +565,15 @@ class UserDatabase:
             with self._get_conn() as conn:
                 conn.execute("UPDATE users SET is_banned = ? WHERE id = ?", (1 if is_banned else 0, user_id))
 
+    def set_user_approval_status(self, user_id: int, status: str) -> None:
+        """Set user approval status."""
+        allowed = {"pending", "approved", "rejected"}
+        if status not in allowed:
+            raise ValueError("无效的审核状态")
+        with self._lock:
+            with self._get_conn() as conn:
+                conn.execute("UPDATE users SET approval_status = ? WHERE id = ?", (status, user_id))
+
     def get_all_users(
         self,
         limit: int = 100,
@@ -527,6 +581,7 @@ class UserDatabase:
         search: str = "",
         is_admin: Optional[bool] = None,
         is_banned: Optional[bool] = None,
+        approval_status: Optional[str] = None,
         trust_level: Optional[int] = None,
         sort_field: str = "created_at",
         sort_order: str = "desc"
@@ -537,15 +592,18 @@ class UserDatabase:
         if search:
             like = f"%{search}%"
             where.append(
-                "(username LIKE ? OR CAST(id AS TEXT) LIKE ? OR linuxdo_id LIKE ? OR github_id LIKE ?)"
+                "(username LIKE ? OR CAST(id AS TEXT) LIKE ? OR linuxdo_id LIKE ? OR github_id LIKE ? OR email LIKE ?)"
             )
-            params.extend([like, like, like, like])
+            params.extend([like, like, like, like, like])
         if is_admin is not None:
             where.append("is_admin = ?")
             params.append(1 if is_admin else 0)
         if is_banned is not None:
             where.append("is_banned = ?")
             params.append(1 if is_banned else 0)
+        if approval_status:
+            where.append("approval_status = ?")
+            params.append(approval_status)
         if trust_level is not None:
             where.append("trust_level = ?")
             params.append(trust_level)
@@ -559,6 +617,7 @@ class UserDatabase:
             "token_count": "(SELECT COUNT(*) FROM tokens t WHERE t.user_id = users.id)",
             "api_key_count": "(SELECT COUNT(*) FROM api_keys k WHERE k.user_id = users.id AND k.is_active = 1)",
             "is_banned": "is_banned",
+            "approval_status": "approval_status",
         }
         sort_column = allowed_sort.get(sort_field, "created_at")
         order = "ASC" if sort_order.lower() == "asc" else "DESC"
@@ -578,6 +637,7 @@ class UserDatabase:
         search: str = "",
         is_admin: Optional[bool] = None,
         is_banned: Optional[bool] = None,
+        approval_status: Optional[str] = None,
         trust_level: Optional[int] = None
     ) -> int:
         """Get total user count with optional filters."""
@@ -586,15 +646,18 @@ class UserDatabase:
         if search:
             like = f"%{search}%"
             where.append(
-                "(username LIKE ? OR CAST(id AS TEXT) LIKE ? OR linuxdo_id LIKE ? OR github_id LIKE ?)"
+                "(username LIKE ? OR CAST(id AS TEXT) LIKE ? OR linuxdo_id LIKE ? OR github_id LIKE ? OR email LIKE ?)"
             )
-            params.extend([like, like, like, like])
+            params.extend([like, like, like, like, like])
         if is_admin is not None:
             where.append("is_admin = ?")
             params.append(1 if is_admin else 0)
         if is_banned is not None:
             where.append("is_banned = ?")
             params.append(1 if is_banned else 0)
+        if approval_status:
+            where.append("approval_status = ?")
+            params.append(approval_status)
         if trust_level is not None:
             where.append("trust_level = ?")
             params.append(trust_level)
@@ -612,11 +675,14 @@ class UserDatabase:
             id=row["id"],
             linuxdo_id=row["linuxdo_id"],
             github_id=row["github_id"],
+            email=row["email"],
             username=row["username"],
             avatar_url=row["avatar_url"],
             trust_level=row["trust_level"],
             is_admin=bool(row["is_admin"]),
             is_banned=bool(row["is_banned"]),
+            approval_status=row["approval_status"] or "approved",
+            password_hash=row["password_hash"],
             created_at=row["created_at"],
             last_login=row["last_login"]
         )
